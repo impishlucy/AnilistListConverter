@@ -1,297 +1,351 @@
 ﻿using System.Diagnostics;
 using System.Windows;
-using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using Microsoft.Win32;
+using System.IO;
+using System.IO.Pipes;
+using System.Text;
+using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 using AniListNet;
 using AniListNet.Objects;
 using AniListNet.Parameters;
 using FuzzySharp;
-using Process = System.Diagnostics.Process;
 
 namespace AnilistListConverter;
 
-
-public partial class MainWindow
+public partial class MainWindow : Window
 {
-    private const string AuthUrl = "https://anilist.co/api/v2/oauth/authorize?client_id=21239&response_type=token";
+    // This is to get the First Instance back in Focus after Logging in.
 
-    AniClient aniClient = new AniClient();
-    
-    int ratelimit = 500;
-    bool changedRatelimit = false;
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    private const int SW_RESTORE = 9;
+
+    // Global Vars
+
+    private AniClient aniClient = new AniClient();
+    private int ratelimit = 2100;
+
+    // This allows to wait for the pipe to receive the token
+    private TaskCompletionSource<string>? _authTcs;
 
     public MainWindow()
     {
         InitializeComponent();
-        this.MouseDown += delegate (object sender, MouseButtonEventArgs e) { if (e.ChangedButton == MouseButton.Left) DragMove(); };
-    }
-    
-    private void ExitButton_Click(object sender, RoutedEventArgs e)
-    {
-        Environment.Exit(0);
-    }
-    public void ChangeRatelimit(int num)
-    {
-        changedRatelimit = true;
-        ratelimit = num;
+        InitializeClient();
+
+        // Start the server that waits for the token.
+        StartNamedPipeServer();
+
+        this.MouseDown += delegate (object sender, MouseButtonEventArgs e)
+        {
+            if (e.ChangedButton == MouseButton.Left) DragMove();
+        };
     }
 
-    private void ApiButton_OnClick(object sender, RoutedEventArgs e)
+    private void InitializeClient()
     {
-        Process.Start(new ProcessStartInfo
+        EnsureProtocolIsRegistered();
+        aniClient.RateChanged += OnRateChanged;
+    }
+
+    // This new Method allows the App to directly get the Token via a Callback.
+    private void EnsureProtocolIsRegistered()
+    {
+        string customProtocol = "AnilistConverter";
+        string applicationPath = Environment.ProcessPath;
+        string registryPath = $@"Software\Classes\{customProtocol}";
+
+        using (RegistryKey key = Registry.CurrentUser.OpenSubKey(registryPath))
         {
-            FileName = AuthUrl,
+            if (key != null)
+            {
+                using (RegistryKey commandKey = key.OpenSubKey(@"shell\open\command"))
+                {
+                    if (commandKey != null)
+                    {
+                        string currentCommand = commandKey.GetValue("") as string;
+                        string expectedCommand = $"\"{applicationPath}\" \"%1\"";
+                        if (currentCommand == expectedCommand) return;
+                    }
+                }
+            }
+        }
+        RegisterProtocol(customProtocol, applicationPath);
+    }
+
+    // This registers the App in Registry, to allow to use AnilistConverter:// in a Browser
+    private void RegisterProtocol(string protocol, string path)
+    {
+        using (var key = Registry.CurrentUser.CreateSubKey($@"Software\Classes\{protocol}"))
+        {
+            key.SetValue("", "URL:AniList Auth Protocol");
+            key.SetValue("URL Protocol", "");
+            using (var commandKey = key.CreateSubKey(@"shell\open\command"))
+            {
+                commandKey.SetValue("", $"\"{path}\" \"%1\"");
+            }
+        }
+    }
+
+    // This puts the App into the "Background" to wait for the Token.
+    private void StartNamedPipeServer()
+    {
+        Task.Run(async () =>
+        {
+            while (true)
+            {
+                try
+                {
+                    using var server = new NamedPipeServerStream("AnilistAuthPipe", PipeDirection.In);
+                    await server.WaitForConnectionAsync();
+
+                    using var reader = new StreamReader(server, Encoding.UTF8);
+                    string url = await reader.ReadLineAsync();
+
+                    if (!string.IsNullOrEmpty(url))
+                    {
+                        FocusWindow();
+
+                        if (_authTcs != null)
+                        {
+                            Dispatcher.Invoke(() => _authTcs.TrySetResult(url));
+                        }
+                    }
+                }
+                catch { /* Well fuck lol, idk. */ }
+            }
+        });
+    }
+
+    // Restore if minimized, then bring to front
+    private void FocusWindow()
+    {
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+
+            this.Activate();
+            this.Focus();
+        });
+    }
+
+    private async void ApiButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        LogBox.Text += "\nOpening AniList for authorization...";
+        LogBox.ScrollToEnd();
+
+        ApiButton.IsEnabled = false;
+        _authTcs = new TaskCompletionSource<string>();
+
+        OpenAuthWebsite();
+
+        // Execution pauses here until the Pipe receives the token.
+        string fullUrl = await _authTcs.Task;
+
+        bool hasAPI = await HandleAPILogin(fullUrl);
+
+        if (hasAPI)
+        {
+            Confirm.Content = "Click to Move Entries.";
+            Confirm.IsEnabled = true;
+            ToggleList.IsEnabled = true;
+            ApiButton.Content = "Logged In";
+            LogBox.Text += $"\nToken Accepted, Logged into Anilist.";
+        }
+        else
+        {
+            ApiButton.IsEnabled = true;
+            ApiButton.Content = "Login Failed - Try Again";
+            LogBox.Text += $"\nToken Rejected by API, try again.";
+        }
+    }
+
+    private void OpenAuthWebsite()
+    {
+        string clientId = "21239";
+
+        string authUrl = $"https://anilist.co/api/v2/oauth/authorize?client_id={clientId}&response_type=token";
+
+        System.Diagnostics.Process.Start(new ProcessStartInfo
+        {
+            FileName = authUrl,
             UseShellExecute = true
         });
+    }
 
-        ApiKey.IsEnabled = true;
-        Confirm.Content = "Click to check Api Token";
-        Confirm.IsEnabled = true;
+    public async Task<bool> HandleAPILogin(string fullUrl)
+    {
+        string token = "";
+        try
+        {
+            // The token should usually be in the URL fragment (#), if not uhh how ?
+            if (fullUrl.Contains("#access_token="))
+            {
+                token = fullUrl.Split("#access_token=")[1].Split('&')[0];
+            }
+        }
+        catch (Exception ex)
+        {
+            LogBox.Text += $"\nError parsing token: {ex.Message}";
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(token)) return false;
+
+        bool success = await aniClient.TryAuthenticateAsync(token);
+        return success;
     }
 
     private void ToggleList_OnClick(object sender, RoutedEventArgs e)
     {
         bool toggle = ToggleList.IsChecked.GetValueOrDefault();
-
         ToggleList.Content = toggle ? "Move Anime to Manga" : "Move Manga to Anime";
     }
 
-    private async void ConfirmSettings_OnClick(object sender, RoutedEventArgs e)
+    private void ConfirmSettings_OnClick(object sender, RoutedEventArgs e)
     {
-        if (!ToggleList.IsEnabled)
-        {
-            var result = await aniClient.TryAuthenticateAsync(ApiKey.Text);
-            if (!aniClient.IsAuthenticated)
-            {
-                Confirm.Width = 500;
-                Confirm.Content = "Token rejected, please try again with a new one.";
-                Confirm.Background = new SolidColorBrush(Colors.Coral);
-            }
-            else
-            {
-                ApiButton.IsEnabled = false;
-                ApiKey.IsEnabled = false;
-                ToggleList.IsEnabled = true;
-                Confirm.IsEnabled = true;
-                Confirm.Content = "Click to move Entries.";
-            }
-        }
-        else
+        if (Confirm.IsEnabled)
         {
             bool toggle = ToggleList.IsChecked.Value;
             MoveLists(toggle);
         }
     }
 
+    // Main function to move the lists, redone for proper Ratelimit handling.
     private async void MoveLists(bool direction)
     {
         try
         {
             MediaType originalType = direction ? MediaType.Anime : MediaType.Manga;
-            LogBox.Text += "\n" +  "OriginalType: " + originalType.ToString();
-            LogBox.ScrollToEnd();
             MediaType newType = direction ? MediaType.Manga : MediaType.Anime;
-            Random random = new Random();
+
+            LogBox.Text += $"\nStarting move from {originalType} to {newType}...";
+            LogBox.ScrollToEnd();
 
             Confirm.IsEnabled = false;
             ToggleList.IsEnabled = false;
-            
-            if (!aniClient.IsAuthenticated)
-            {
-                LogBox.Text += "\n" +  "MainWindow.MoveLists: AniClient is not authenticated.";
-                LogBox.ScrollToEnd();
-                Confirm.Content = "AniList authentication failed. Please check your token.";
-                Confirm.Background = new SolidColorBrush(Colors.Coral);
-                return;
-            }
 
-            await Task.Delay(ratelimit);
+            if (!aniClient.IsAuthenticated) return;
 
             var user = await aniClient.GetAuthenticatedUserAsync();
-            
-            if (user == null)
-            {
-                LogBox.Text += "\n" + "MainWindow.MoveLists: Authenticated user is null.";
-                LogBox.ScrollToEnd();
-                Confirm.Content = "Failed to fetch user info. Check your token.";
-                Confirm.Background = new SolidColorBrush(Colors.Coral);
-                return;
-            }
+            if (user == null) return;
 
+            int page = 1;
+            List<MediaEntry> entriesToMove = new();
+            MediaEntryCollection collection;
 
-            int page = 0;
-            var pagination = new AniPaginationOptions(page, 25);
-            
-            if (pagination == null)
-            {
-                LogBox.Text += "\n" + "Pagination object is null.";
-                LogBox.ScrollToEnd();
-                return;
-            }
-            
-            LogBox.Text += "\n" + $"Pagination pageIndex={pagination.PageIndex}, pageSize={pagination.PageSize}";
-            LogBox.ScrollToEnd();
-
-            MediaEntryCollection? mediaEntryCollection = null;
-
-            try
-            {
-                LogBox.Text += "\n" + $"Calling GetUserEntryCollectionAsync with userId={user.Id}, type={originalType}, page={page}";
-                LogBox.ScrollToEnd();
-                await Task.Delay(ratelimit);
-                mediaEntryCollection = await aniClient.GetUserEntryCollectionAsync(user.Id, originalType, new AniPaginationOptions(page, 25));
-            }
-            catch (Exception ex)
-            {
-                ChangeRatelimit(1000);
-                return;
-            }
-
-            if (mediaEntryCollection.Lists.Length <= 0)
-            {
-                Confirm.Width = 500;
-                Confirm.Content = "No Entries found.";
-                Confirm.Background = new SolidColorBrush(Colors.Coral);
-                return;
-            }
-            
-            List<MediaEntry> unfilteredEntries = new();
-            LogBox.Text += "\n" + "Done adding, filtering...";
-            LogBox.ScrollToEnd();
+            // Fetch all entries.
             do
             {
-                foreach (var list in mediaEntryCollection.Lists)
-                {
-                    unfilteredEntries.AddRange(list.Entries);
-                }
                 await Task.Delay(ratelimit);
-                if (mediaEntryCollection.HasNextChunk)
+                collection = await aniClient.GetUserEntryCollectionAsync(user.Id, originalType, new AniPaginationOptions(page, 25));
+                foreach (var list in collection.Lists)
                 {
-                    page++;
-                    pagination = new AniPaginationOptions(page, 25);
-                    mediaEntryCollection = await aniClient.GetUserEntryCollectionAsync(user.Id, originalType, pagination);
+                    entriesToMove.AddRange(list.Entries.Where(x => x.Status == MediaEntryStatus.Planning));
                 }
-            } while (mediaEntryCollection.HasNextChunk);
-            
-            LogBox.Text += "\n" + "Added UnfilteredEntries successfully.";
-            LogBox.ScrollToEnd();
+                page++;
+            } while (collection.HasNextChunk);
 
-            if (unfilteredEntries.Count <= 0)
+            if (entriesToMove.Count == 0)
             {
-                Confirm.Width = 500;
-                Confirm.Content = "No Entries found.";
-                Confirm.Background = new SolidColorBrush(Colors.Coral);
+                LogBox.Text += "\nNo Planning entries found.";
                 return;
             }
 
-            List<MediaEntry> entries = unfilteredEntries
-                .Where(e => e.Media != null && e.Media.Type == originalType && e.Status == MediaEntryStatus.Planning)
-                .ToList();
-            
-            LogBox.Text += "\n" + "Created entries successfully.";
-            LogBox.ScrollToEnd();
-            
+            // Move each Entry.
             Progress.Visibility = Visibility.Visible;
-            Confirm.Background = new SolidColorBrush(Colors.ForestGreen);
+            int current = 0;
 
-            double progressPerEntry = 100.0 / entries.Count;
-            double currentProgress = 0;
-            int currentEntry = 0;
-
-            List<string?> notFound = new();
-
-            LogBox.Text += "\n" + "Waiting 10s then continuing to move at a slow rate.";
-            LogBox.Text += "\n" + "Sorry that it has to be slow, but the API is ass.";
-            LogBox.ScrollToEnd();
-            
-            await Task.Delay(10000);
-            
-            ChangeRatelimit(2000);
-            foreach (var data in entries)
+            foreach (var entry in entriesToMove)
             {
+                current++;
+                Progress.Value = (double)current / entriesToMove.Count * 100;
+                Confirm.Content = $"Processing {current}/{entriesToMove.Count}";
+
+                string nativeTitle = entry.Media.Title?.NativeTitle;
+                if (string.IsNullOrEmpty(nativeTitle)) continue;
+
+                LogBox.Text += $"\nProcessing {entry.Media.Title.EnglishTitle ?? nativeTitle}";
+                LogBox.ScrollToEnd();
+
                 try
                 {
-                    LogBox.Text += "\n" + $"Moving {data.Media.Title.EnglishTitle}";
-                    LogBox.ScrollToEnd();
-                    
-                    currentProgress += progressPerEntry;
-                    Progress.Value = currentProgress;
-                    Confirm.Content = $"Moving {entries.Count - currentEntry} Entries.";
-                    currentEntry++;
-
-                    var nativeTitle = data.Media.Title?.NativeTitle;
-                    if (string.IsNullOrWhiteSpace(nativeTitle))
-                    {
-                        notFound.Add(null);
-                        continue;
-                    }
-
-                    var filter = new SearchMediaFilter
-                    {
-                        Query = nativeTitle,
-                        Type = newType,
-                        Sort = MediaSort.Popularity
-                    };
-                    
+                    // Search for a Match
                     await Task.Delay(ratelimit);
+                    var searchResults = await aniClient.SearchMediaAsync(new SearchMediaFilter { Query = nativeTitle, Type = newType }, new AniPaginationOptions(1, 10));
 
-                    var results = await aniClient.SearchMediaAsync(filter, new AniPaginationOptions(1, 20));
-
-                    int newID = 0;
-                    if (results.TotalCount > 0)
+                    int targetId = 0;
+                    foreach (var result in searchResults.Data)
                     {
-                        foreach (var result in results.Data)
+                        if (Fuzz.Ratio(result.Title.NativeTitle, nativeTitle) >= 85)
                         {
-                            if (string.IsNullOrEmpty(result.Title?.NativeTitle))
-                                continue;
-                            int score = Fuzz.Ratio(result.Title.NativeTitle, nativeTitle);
-                            if (score >= 85)
-                            {
-                                newID = result.Id;
-                                break;
-                            }
+                            targetId = result.Id;
+                            break;
                         }
                     }
-                    await Task.Delay(ratelimit);
-                    await aniClient.DeleteMediaEntryAsync(data.Id);
-                    if (changedRatelimit)
-                    {
-                        ChangeRatelimit(2000);
-                        changedRatelimit = false;
-                    }
-                    if (newID == 0)
-                        continue;
 
-                    var mutation = new MediaEntryMutation
+                    // Actually move the Entry.
+                    if (targetId != 0)
                     {
-                        Status = MediaEntryStatus.Planning,
-                        Progress = 0
-                    };
-                    await Task.Delay(ratelimit);
-                    await aniClient.SaveMediaEntryAsync(newID, mutation);
-                    if (changedRatelimit)
-                    {
-                        ChangeRatelimit(2000);
-                        changedRatelimit = false;
+                        await Task.Delay(ratelimit);
+                        await aniClient.DeleteMediaEntryAsync(entry.Id);
+
+                        await Task.Delay(ratelimit);
+                        await aniClient.SaveMediaEntryAsync(targetId, new MediaEntryMutation { Status = MediaEntryStatus.Planning });
                     }
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex.Message.Contains("429"))
                 {
-                    notFound.Add(data.Media?.Title?.NativeTitle ?? "Unknown");
-                    ChangeRatelimit(30000);
-                    Console.WriteLine($"Error processing entry {data.Id}: {ex.Message}");
+                    // If we STILL hit a 429 despite the delays, just get the new Ratelimit and wait.
+                    // This could end in an Infinite loop in edgecases, but it should be fine.
+                    LogBox.Text += "\n[Error] Undefined Ratelimit hit. Waiting a bit.";
+                    await Task.Delay(ratelimit + 4000);
                 }
             }
 
-            LogBox.Text += "\n" + "Important, please restart the Program and recheck if all got moved.";
-            LogBox.ScrollToEnd();
-            Confirm.Content = "Moved all Entries.";
+            LogBox.Text += "\nProcess complete.";
+            Confirm.Content = "Finished!";
         }
         catch (Exception ex)
         {
-            ChangeRatelimit(30000);
-            LogBox.ScrollToEnd();
+            LogBox.Text += $"\nError: {ex.Message}";
+        }
+        finally
+        {
+            Confirm.IsEnabled = true;
+            ToggleList.IsEnabled = true;
         }
     }
+
+    private void OnRateChanged(object? sender, AniRateEventArgs e)
+    {
+        if (e.RetryAfter > 0)
+        {
+            // If we are actually rate limited, AniList tells us how many seconds to wait.
+            ratelimit = (int)(e.RetryAfter);
+            LogBox.Text += $"\n[Error] Global Rate Limit hit. Pausing for {e.RetryAfter}s.";
+            LogBox.ScrollToEnd();
+        }
+        else
+        {
+            // Otherwise we use the given one
+            if (e.RateLimit != 0 && e.RateLimit != ratelimit)
+            {
+                ratelimit = e.RateLimit;
+            }
+        }
+    }
+
+    private void ExitButton_Click(object sender, RoutedEventArgs e) => Environment.Exit(0);
 }

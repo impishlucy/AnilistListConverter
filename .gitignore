@@ -4,6 +4,9 @@ cmake-build-*/
 # Jetbrains cache
 .idea/
 
+# Visual Studio cache
+.vs/
+
 # File-based project format
 *.iws
 

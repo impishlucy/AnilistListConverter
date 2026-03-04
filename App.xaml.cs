@@ -1,44 +1,47 @@
-﻿using System.Configuration;
-using System.Data;
+﻿using System.IO;
+using System.IO.Pipes;
+using System.Text;
 using System.Windows;
 
 namespace AnilistListConverter;
 
-/// <summary>
-/// Interaction logic for App.xaml
-/// </summary>
 public partial class App : Application
 {
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
 
-        // Add a global exception handler
-        AppDomain.CurrentDomain.UnhandledException += (sender, args) =>
+        // Check if App got launched with the argument
+        if (e.Args.Length > 0 && e.Args[0].StartsWith("AnilistConverter://", StringComparison.OrdinalIgnoreCase))
         {
-            Exception ex = (Exception)args.ExceptionObject;
-            ShowErrorAndShutdown(ex);
-        };
+            // SECOND INSTANCE
+            SendTokenToMainInstance(e.Args[0]);
 
-        // Also catch UI thread exceptions
-        DispatcherUnhandledException += (sender, args) =>
-        {
-            Exception ex = args.Exception;
-            args.Handled = true;
-            ShowErrorAndShutdown(ex);
-        };
+            // Shut down immediately so no window appears
+            Shutdown();
+            return;
+        }
+
+        // FIRST INSTANCE
+        MainWindow mainWindow = new MainWindow();
+        mainWindow.Show();
     }
 
-    private void ShowErrorAndShutdown(Exception ex)
+    // Pass token to other Instance.
+    private void SendTokenToMainInstance(string url)
     {
-        MessageBox.Show(
-            $"A fatal error occurred:\n\n{ex.Message}\n\n{ex.StackTrace}",
-            "Unexpected Error",
-            MessageBoxButton.OK,
-            MessageBoxImage.Error);
-
-        Current.Shutdown(); // more graceful than Environment.Exit
+        try
+        {
+            // Connect to the pipe created by the first instance
+            using var client = new NamedPipeClientStream(".", "AnilistAuthPipe", PipeDirection.Out);
+            client.Connect(2000);
+            using var writer = new StreamWriter(client, Encoding.UTF8);
+            writer.WriteLine(url);
+            writer.Flush();
+        }
+        catch
+        {
+            // User closed first instance while requesting a Token... Not my Problem.
+        }
     }
 }
-
-

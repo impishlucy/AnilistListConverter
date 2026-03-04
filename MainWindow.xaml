@@ -66,16 +66,13 @@
                             Click="ApiButton_OnClick"/>
                 
                     <!-- Main Input -->
-                    <TextBox Grid.Row="1" x:Name="ApiKey" Width="300" Height="35"
-                                         HorizontalAlignment="Center" VerticalAlignment="Center" Margin="10"
-                                         IsEnabled="False"/>
-                
+
                     <ToggleButton Grid.Row="2" x:Name="ToggleList" Width="300" Height="35" IsEnabled="False"
                                   Content="Move Manga to Anime"
                                   Click="ToggleList_OnClick"/>
                 
                     <Button Grid.Row="3" x:Name="Confirm" Width="300" Height="35" IsEnabled="False" 
-                            Content="Please copy your Api Token" FontSize="18"
+                            Content="Please get your Api Token" FontSize="18"
                             Click="ConfirmSettings_OnClick"/>
                 </Grid>
                 

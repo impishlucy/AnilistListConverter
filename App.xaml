@@ -1,8 +1,7 @@
 ﻿<Application x:Class="AnilistListConverter.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:anilistListConverter="clr-namespace:AnilistListConverter"
-             StartupUri="MainWindow.xaml">
+             xmlns:anilistListConverter="clr-namespace:AnilistListConverter">
     <Application.Resources>
         <!-- Transparent Background for Grids -->
         <Style TargetType="Grid">
