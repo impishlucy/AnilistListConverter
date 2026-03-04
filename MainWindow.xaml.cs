@@ -245,7 +245,7 @@ public partial class MainWindow : Window
             List<MediaEntry> entriesToMove = new();
             MediaEntryCollection collection;
 
-            // Fetch all entries.
+            // --- FETCHING ENTRIES ---
             do
             {
                 await Task.Delay(ratelimit);
@@ -263,7 +263,7 @@ public partial class MainWindow : Window
                 return;
             }
 
-            // Move each Entry.
+            // --- PROCESSING ENTRIES ---
             Progress.Visibility = Visibility.Visible;
             int current = 0;
 
@@ -279,71 +279,94 @@ public partial class MainWindow : Window
                 LogBox.Text += $"\nProcessing {entry.Media.Title.EnglishTitle ?? nativeTitle}";
                 LogBox.ScrollToEnd();
 
-                try
+                // TRUE RETRY LOOP FOR INDIVIDUAL ENTRY
+                bool success = false;
+                while (!success)
                 {
-                    // Search for a Match
-                    await Task.Delay(ratelimit);
-                    var searchResults = await aniClient.SearchMediaAsync(new SearchMediaFilter { Query = nativeTitle, Type = newType }, new AniPaginationOptions(1, 10));
-
-                    int targetId = 0;
-                    foreach (var result in searchResults.Data)
+                    try
                     {
-                        if (Fuzz.Ratio(result.Title.NativeTitle, nativeTitle) >= 85)
+                        // 1. Search for target
+                        await Task.Delay(ratelimit);
+                        var searchResults = await aniClient.SearchMediaAsync(new SearchMediaFilter { Query = nativeTitle, Type = newType }, new AniPaginationOptions(1, 10));
+
+                        int targetId = 0;
+                        foreach (var result in searchResults.Data)
                         {
-                            targetId = result.Id;
-                            break;
+                            if (Fuzz.Ratio(result.Title.NativeTitle, nativeTitle) >= 85)
+                            {
+                                targetId = result.Id;
+                                break;
+                            }
                         }
-                    }
 
-                    // Actually move the Entry.
-                    if (targetId != 0)
+                        if (targetId != 0)
+                        {
+                            // 2. Delete original and 3. Save new
+                            await Task.Delay(ratelimit);
+                            await aniClient.DeleteMediaEntryAsync(entry.Id);
+
+                            await Task.Delay(ratelimit);
+                            await aniClient.SaveMediaEntryAsync(targetId, new MediaEntryMutation { Status = MediaEntryStatus.Planning });
+                        }
+
+                        success = true; // Success, break the 'while' loop for this entry
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("429"))
                     {
-                        await Task.Delay(ratelimit);
-                        await aniClient.DeleteMediaEntryAsync(entry.Id);
+                        // The 'ratelimit' variable was just updated by OnRateChanged.
+                        LogBox.Text += $"\n[!] 429 Hit. Waiting {ratelimit}ms before retry...";
+                        LogBox.ScrollToEnd();
 
                         await Task.Delay(ratelimit);
-                        await aniClient.SaveMediaEntryAsync(targetId, new MediaEntryMutation { Status = MediaEntryStatus.Planning });
+                        // The 'while' loop continues to retry this exact entry.
                     }
-                }
-                catch (Exception ex) when (ex.Message.Contains("429"))
-                {
-                    // If we STILL hit a 429 despite the delays, just get the new Ratelimit and wait.
-                    // This could end in an Infinite loop in edgecases, but it should be fine.
-                    LogBox.Text += "\n[Error] Undefined Ratelimit hit. Waiting a bit.";
-                    await Task.Delay(ratelimit + 4000);
                 }
             }
 
-            LogBox.Text += "\nProcess complete.";
-            Confirm.Content = "Finished!";
+            // SUCCESSFUL COMPLETION LOGIC
+            Dispatcher.Invoke(() => {
+                LogBox.Text += "\nProcess complete.";
+                Confirm.Content = "Finished!";
+            });
         }
         catch (Exception ex)
         {
-            LogBox.Text += $"\nError: {ex.Message}";
+            // OUTER ERROR HANDLING
+            Dispatcher.Invoke(() => {
+                LogBox.Text += $"\n[Error] Process failed: {ex.Message}";
+                LogBox.ScrollToEnd();
+            });
         }
         finally
         {
-            Confirm.IsEnabled = true;
-            ToggleList.IsEnabled = true;
+            // UI RESET LOGIC (Always executes)
+            Dispatcher.Invoke(() => {
+                Confirm.IsEnabled = true;
+                ToggleList.IsEnabled = true;
+                Progress.Visibility = Visibility.Hidden;
+            });
         }
     }
 
     private void OnRateChanged(object? sender, AniRateEventArgs e)
     {
-        if (e.RetryAfter > 0)
+        // The definition confirms RetryAfter is an int? of seconds.
+        if (e.RetryAfter.HasValue && e.RetryAfter.Value > 0)
         {
-            // If we are actually rate limited, AniList tells us how many seconds to wait.
-            ratelimit = (int)(e.RetryAfter);
-            LogBox.Text += $"\n[Error] Global Rate Limit hit. Pausing for {e.RetryAfter}s.";
-            LogBox.ScrollToEnd();
+            // Convert seconds to milliseconds and add a 1.5s buffer.
+            ratelimit = (e.RetryAfter.Value * 1000) + 1500;
+
+            Dispatcher.Invoke(() =>
+            {
+                LogBox.Text += $"\n[!] Rate Limit hit. Pausing for {e.RetryAfter.Value}s.";
+                LogBox.ScrollToEnd();
+            });
         }
         else
         {
-            // Otherwise we use the given one
-            if (e.RateLimit != 0 && e.RateLimit != ratelimit)
-            {
-                ratelimit = e.RateLimit;
-            }
+            // Dynamic pacing: if we have more than 10 requests left, stay fast (750ms).
+            // Otherwise, slow down to 3s to prevent hitting the hard block.
+            ratelimit = e.RateRemaining < 10 ? 3000 : 750;
         }
     }
 
